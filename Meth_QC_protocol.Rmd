@@ -1,0 +1,616 @@
+---
+title: "Meth_QC"
+author: "EG"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document: 
+    number_sections: yes
+    toc: yes
+    code_folding: show
+---
+
+# README
+
+This script is written in RMarkdown, which means you can 'knit' it neatly into an HTML, if you like. However, if you are unfamiliar with it, you can run each chunk (except the "Setup" chunk) as is and it will provide the results as regular R script.  
+Most functions are either from minfi, or tidyverse, or my own repository of helper functions (these are optional, you can write your own code if that's more comfortable).  
+Many lines of code are devoted to making the pipeline more streamlined and data manageable, but they are not vital. One major side-effect of that is the folder structure which needs to be in place, so that the various outputs can be saved safely and retrieved easily.
+
+## Folder structure  
+Project/Data - contains all subfolders of Illumina output (sometimes named 'Run1', 'Run2', with subsequent subfolders with the 'Sentrix Array' ID, and IDAT files therein, e.g., "'Sentrix Array'_'Sentrix Well'_red/green/idat/etc")
+Project/Docs - contains sample sheet, phenotype files, etc  
+Project/ROut - all output from this script is saved in subfolders here  
+Project/ROut/QC - QC pipeline output  
+Project/ROut/QC/RDS - some R objects are saved as .rds files here, they are usually huge and it's better to only have them loaded onto the environment when needed  
+Project/ROut/QC/RDS/ComBat - using my function on auto mode generates multiple ComBat outputs  
+Project/ROut/QC/Tables - all .csv, .txt outputs  
+Project/ROut/QC/Plots - all plots  
+Project/ROut/QC/Plots/PCA - my PCA function generates heatmap, bar plot, and scatter plots  
+Project/ROut/QC/Plots/PCA/ComBat - all PCA results of the different ComBat outputs 
+
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, cache = FALSE, message = FALSE, eval = FALSE, tidy = TRUE)
+```
+
+```{r Library, eval=TRUE}
+# usual libraries to install
+library(tibble)
+library(tidyverse)
+library(readr)
+library(readxl)
+library(data.table)
+library(magrittr)
+library(stringr)
+library(rlist)
+library(lubridate)
+library(forcats)
+
+# methylation specific libraries to install
+# some functions require additional libraries that are automatically installed when that function is called
+
+# library(minfi, lib.loc = "/exports/meaney.lab/egarg/R/x86_64-redhat-linux-gnu-library/3.4") # install this version only for cord blood cell counts - it contains a slight modification of the function to avoid data format error
+
+library(minfi)
+library(limma)
+library(matrixStats)
+library(sva)
+
+# set ggplot theme, not necessary
+them <- theme_bw()
+theme_set(them)
+
+# source functions to use
+walk(list.files("../RFunctions/", recursive = TRUE, full.names = TRUE), source)
+```
+
+```{r Importing_IDAT}
+
+### Framework for data import ####
+
+## provide sample sheet
+
+targets <- read.metharray.sheet(base="Docs", pattern="samplesheet", recursive = TRUE) %>%
+  dplyr::select(-starts_with("x"), -Pool_ID, -Basename, -Batch) 
+# usually empty columns are named x1, x2, etc.; this is to remove them and any other columns that do not hold any useful information 
+# also removes Basename if that needs to be defined manually (for example if the sample sheet is in a different folder than the actual data)
+
+## upgrade sample sheet
+
+targetsites <- data.frame(paths = list.files(Sys.glob("Data/Run*"), pattern = "Red.idat", recursive = TRUE, full.names = TRUE)) %>% # find all the unique Basename paths
+  mutate(RUN = as.integer(str_match(str_match(paths, regex("Run[0-9]")), regex("[0-9]"))), # create column with 'Run' number
+         Batch = 1, # create column with 'Batch' number if it exists (for example when longitudinal samples are run years apart), otherwise default is 1
+         Sentrix_Array = str_split(str_split(paths, pattern = "/", simplify = TRUE)[,11], pattern = "_", simplify = TRUE)[,1], # the names of the subfolders containing the IDAT files
+         Sentrix_Well = str_split(str_split(paths, pattern = "/", simplify = TRUE)[,11], pattern = "_", simplify = TRUE)[,2], # the row and column location specifier in every IDAT file
+         Basename = str_replace(paths, "_Red.idat", "")) %>% # create Basename paths so that minfi can find all the files associated with a Sentrix Array and Sentrix Position combination
+  dplyr::select(-paths)
+
+targets %<>% full_join(targetsites) %>% # if the additional information is correct, join it with the existing sample sheet information 
+  # if the sample names in the sample sheet are a conglomeration of several things, they should be organized into separate columns
+  mutate(ID = str_extract(Sample_Name, regex("^[0-9]+")), # pheno ID consisting only of numbers
+         REP = str_extract(Sample_Name, regex("REP[0-9]")), # replicate info
+         Sample_Row = str_extract(Sample_Well, regex("[[:alpha:]]+")), # separate Sample Well into Sample Row and Sample Column
+         Sample_Column = str_extract(Sample_Well, regex("[0-9]+")), 
+         Sentrix_Row = str_extract(Sentrix_Well, regex("[0-9]+")),  # separate Sentrix Well into Sentrix Row and Sentrix Column
+         Sentrix_Column = str_extract(Sentrix_Well, regex("[0-9]+$"))) %>% 
+  unite(Sample_ID, c(Sentrix_Array, Sentrix_Well), remove = FALSE) %>% # unite Sentrix Array and Sentrix Well to form a unique Sample ID for each sample in the dataset (one can be matched to multiple "ID"s if for example replicates exist or longitudinal data exists)
+  mutate_all(as.character) # so that all number columns are also treated as character, and if there is a factor column, that too is converted to character
+
+targets %>% dplyr::select(-Basename) %>% mutate_all(as.factor) %>% summary() # useful check
+
+### Data import ####
+
+## create RGChannelSet
+
+rgSet <- read.metharray.exp(targets=targets, recursive = TRUE, verbose = TRUE, force = TRUE, extended = TRUE)
+# 'force' = T is helpful if the data is split into older and newer arrays, which may not have the same CpG sites, this takes the common sites, thus forcing them to have a common size (mostly some CpGs from the older array are discarded, so that only the good ones also present in the newer array are considered, and in one case where I had to use it, some of the sites discarded from the older dataset were also removed in its prior QC)
+# 'extended' = T is very useful because using this we can extract the beads info directly from minfi, circumventing the need to use Genome Studio for that purpose
+
+## create related data sets from RGChannelSet using suitable minfi functions
+
+Mset <- preprocessRaw(rgSet)
+qc <- getQC(Mset)
+detP <- detectionP(rgSet)
+
+## save all objects as RDS files
+
+write_rds(detP, file="ROut/QC/RDS/detection_pval.rds")
+write_rds(rgSet, file="ROut/QC/RDS/rgSet_raw.rds")
+write_rds(qc, "ROut/QC/RDS/QC_uMed_mMed_raw.rds")
+
+```
+
+```{r Get_pheno}
+pheno_data <- read_csv("Docs/pheno.csv") # read in your pheno file, if any, or create one from multiple files
+
+pheno_all <- targets %>% dplyr::select(-Basename) %>% left_join(pheno_data) # join them with the upgraded sample sheet created in the last chunk
+
+write_csv(pheno_all, "Docs/PhenoFile100.csv") # save the full file in Project/Docs folder, e.g. "PhenoFile100.csv" where 100 is the total number of samples in the data (including all controls, replicates, etc.)
+
+# you can also create a stripped down version with only the variables you are interested in
+```
+
+```{r Read_futuredata, eval=TRUE}
+
+# when knitting the HTML to generate the QC report, the entire QC does not have to be repeated
+# because we save the results and files as we go along
+# so all we have to do is retrieve them as needed
+# all the lines marked with skip-for-report can be commented out for the report generation to avoid unnecessary time
+
+## generated during QC
+
+qc <- readRDS("ROut/QC/RDS/QC_uMed_mMed_raw.rds") # minfi QC report
+repsex <- read_csv("ROut/QC/Tables/PredictedSexAndReportedGender.csv") # predicted vs reported sex
+detP <- readRDS("ROut/QC/RDS/detection_pval.rds") # detection p-value for all samples and all probes
+sample_qc <- read_csv("ROut/QC/Tables/detP_sampleQC.csv") # detection p-value QC for samples
+cpg_qc <- read_csv("ROut/QC/Tables/detP_cpgQC.csv") # detection p-value QC for probes
+detPyf <- read_csv("ROut/QC/Tables/detP_YfQC.csv") # detection p-value threshold determination based on the Y-chromosome distribution in females
+
+## files needed for QC
+
+pheno_all <- read_csv("Docs/PhenoFile100.csv") # pheno file containing at least all the variables in
+manifestB4_basics <- fread("/share/projects/methyldata/manifests/m850/MethylationEPIC_v-1-0_B4.csv", skip = 7, fill = TRUE, select = c("Name", "CHR", "MAPINFO"))[!is.na(MAPINFO)] # skip-for-report
+rgSet <- read_rds("ROut/QC/RDS/rgSet_raw.rds")
+rgSetMainAutosomal <- read_rds("ROut/QC/RDS/rgSetMainAutosomal.rds") # skip-for-report
+
+## results of QC
+
+SAMlist <- read_rds("ROut/QC/RDS/SAMlist.rds")
+CPGlist <- read_rds("ROut/QC/RDS/CPGlist.rds")
+# Samples to remove
+SAMlist_removeYES <- unique(unlist(list.remove(SAMlist, grep("removeYES", names(SAMlist), value = T, invert = T)), use.names=F))
+# CpGs to remove
+CPGlist_removeYES <- unique(unlist(list.remove(CPGlist, grep("removeYES", names(CPGlist), value = T, invert = T)), use.names=F))
+```
+
+# Sample QC
+
+## Minfi QC
+
+Based on methylated and unmethylated values per sample :  
+- if a sample has both the median values less than 10.5, it is removed  
+- if a sample has the squares of both the medians summed less than double the square of 10.5, it is *maybe* removed
+
+
+```{r Sample_QC_1, eval=TRUE}
+
+SAMlist = list() # skip-for-report
+# create a new list that will be populated by aptly named vectors of "bad" samples, which are either tagged with "removeYES" or "removeMAYBE"
+# it contains "Sample_ID" names as defined in the sample sheet used to import data, because those are the names that the rgSet also uses and hence all its downstream products use as well 
+# this is created once but updated and saved in every sample QC chunk
+
+
+SAMlist$plotQCboth10.5_removeYES = row.names(qc[which(qc$mMed<10.5 & qc$uMed<10.5),]) # skip-for-report
+# samples that have both the median values less than 10.5
+
+SAMlist$plotQCtotal21_removeMAYBE = setdiff(row.names(qc[which(qc$mMed^2+qc$uMed^2<2*10.5^2),]), SAMlist$plotQCboth10.5_removeYES) # skip-for-report
+# samples that have the squares of both the medians summed less than double the square of 10.5 and are not in the "removeYES" list (21 = 10.5*2, it signifies the indirect use of 10.5)
+
+# minfi plot
+plotQC(qc) # this is not very editable, therefore the following code regenerates it with ggplot, adding in customizations
+
+# ggplot
+basic_qc <- data.frame(qc@listData, Sample_ID = qc@rownames, Sample_Index = 1:nrow(qc)) %>% 
+  full_join(pheno_all, by="Sample_ID") %>% 
+  mutate(Sample_Index = ifelse(Sample_ID %in% SAMlist$plotQCtotal21_removeMAYBE, Sample_Index, NA)) %>%
+  mutate_if(is.integer, as.factor) %>%
+  mutate_if(is.character, as.factor)
+
+## experimental-work START
+
+## the following commented chunk of code maybe useful if you would like to have interactive selections - uses package 'manipulate'
+
+# manipulate(ggplot(basic_qc, aes(mMed, uMed, color=colorscale)) +
+#   geom_point() +
+#   geom_text(aes(label = labelname), nudge_y = 0.05, show.legend = F, na.rm = T) +
+#   geom_abline(intercept = cutoff*2, slope = -1, linetype=2, color="red") +
+#   coord_equal() +
+#   them + 
+#   scale_color_discrete("Factor") +
+#   labs(x = "Methylated median intensity (log2)", y = "Unmethylated median intensity (log2)") +
+#   ggtitle("plotQC","badSampleCutoff=10.5"),
+#   colorscale = picker("Batch" = basic_qc$Batch, 
+#                       "Gender" = basic_qc$Gender, 
+#                       "Sample_Type" = basic_qc$Sample_Type,
+#                       "Sample_Tissue" = basic_qc$Sample_Tissue, 
+#                       "RUN" = basic_qc$RUN, 
+#                       "Sample_Row" = basic_qc$Sample_Row, 
+#                       "Sample_Column" = basic_qc$Sample_Column, 
+#                       "Sentrix_Row" = basic_qc$Sentrix_Row, 
+#                       "Sentrix_Column" = basic_qc$Sentrix_Column, 
+#                       label = "Color"), 
+#   labelname = picker("NULL" = NA,
+#                      "ID" = basic_qc$ID,
+#                      "Sample_Name" = basic_qc$Sample_Name,
+#                      "Sample_ID" = basic_qc$Sample_ID, 
+#                      label = "Label"),
+#   cutoff = slider(round(min(basic_qc$uMed, basic_qc$mMed), 1), 11, initial = 10.5, label = "Bad Sample Cut-off", step = 0.1))
+# ggsave("ROut/QC/Plots/ggplotQC.png")
+## experimental-work END
+
+basic_qc %>%
+  ggplot(aes(mMed, uMed, color=Batch)) + # the color group can be changed to any pheno variable you might want to look at, e.g., Gender; but if you add a factor with too many levels it will not be helpful
+  geom_point() +
+  geom_text(aes(label = Sample_Index), nudge_y = 0.05, show.legend = F, na.rm = T) + # with many samples it is easier to see the sample index (as in the basic_qc object) rather than Sample_IDs because there's a lot of overlap
+  geom_abline(intercept = 21, slope = -1, linetype=2, color="red") +
+  coord_equal() +
+  them +
+  labs(x = "Methylated median intensity (log2)", y = "Unmethylated median intensity (log2)") +
+  ggtitle("plotQC","badSampleCutoff=10.5")
+
+write_rds(SAMlist, "ROut/QC/RDS/SAMlist.rds") # skip-for-report 
+# saving the edited list
+```
+
+## Gender check
+
+Based on X and Y probe values :  
+- if a sample has different reported and predicted sex, it is *maybe* removed (check phenotype info again, and remove if it is still not reconciled)
+
+```{r Sample_QC_2, eval=TRUE}
+
+## Samples to remove
+SAMlist_removeYES <- unique(unlist(list.remove(SAMlist, grep("removeYES", names(SAMlist), value = T, invert = T)), use.names=F)) # everytime we identify a sample to be removed for sure, we do not want to consider it in the next step, therefore, we filter it out
+
+## skip-for-report START
+predsex <- data.frame(getSex(mapToGenome(preprocessRaw(rgSet)))) # predict gender based on X-Y values
+
+repsex <- predsex %>%
+  mutate(Sample_ID = row.names(predsex)) %>%
+  full_join(pheno_all[,c("Sample_ID","ID","Gender")]) %>%
+  dplyr::filter(!(Sample_ID %in% SAMlist_removeYES)) %>%
+  mutate(reportedSex = substring(Gender, 1, 1))
+## skip-for-report END
+
+repsex %>% 
+  ggplot(aes(x = xMed, y = yMed, color = reportedSex)) +
+  geom_point() +
+  them +
+  labs(x = "Chromosome X median intensity", y = "Chromosome Y median intensity")
+
+repsex %>% 
+  dplyr::select(ID, contains("sex")) %>%
+  group_by(predictedSex, reportedSex) %>% 
+  dplyr::count() %>% 
+  ggplot() +
+  geom_text(aes(x=reportedSex, y=predictedSex, label=n), size=5) +
+  them +
+  theme(legend.position="none")
+
+## skip-for-report START
+SAMlist$notin1_mismatchSex_removeMAYBE = dplyr::filter(repsex, predictedSex!=reportedSex)[["Sample_ID"]]
+# change name to removeYES if the sample gender is unsure, could be that the sample quality is low or that the pheno file information is incorrect, in either case, you do not want to include this sample
+
+write_csv(repsex, "ROut/QC/Tables/PredictedSexAndReportedGender.csv")
+write_rds(SAMlist, "ROut/QC/RDS/SAMlist.rds") 
+## skip-for-report END
+```
+
+## Call rate
+
+Based on number of probe-sample pairs with detection p-value more than 0.01 :  
+- if a sample has call rate of less than 95%, it is removed  
+- if a sample has call rate of less than 98%, it is *maybe* removed
+
+```{r Sample_QC_3, eval=TRUE}
+
+## skip-for-report START
+detP = readRDS("ROut/QC/RDS/detection_pval.rds")
+detPmelt = as.data.frame(detP) %>%
+  rownames_to_column("cpgs") %>%
+  dplyr::select(-one_of(SAMlist_removeYES)) %>%
+  gather(Sample_ID, detPval, -cpgs)
+
+sample_qc = detPmelt %>%
+  dplyr::filter(detPval>0.01) %>%
+  dplyr::count(Sample_ID, sort = T) %>%
+  mutate(callrate_per_sample = 100*(1-n/dim(detP)[[1]]))
+## skip-for-report END
+
+## experimental-work START
+
+# manipulate(ggplot(sample_qc, aes(x = callrate_per_sample)) + 
+#   geom_histogram(binwidth = binwidthslider) +
+#   them +
+#   ggtitle("Probes with detP > 0.01"),
+#   binwidthslider = slider(min = 0.01, max = 0.1, step = 0.01, initial = 0.1, label = "Binwidth"))
+
+## needs work
+# sample_qc %>% 
+#   mutate(callrate_per_sample_roundup = as.factor(ceiling(callrate_per_sample))) %>% 
+#   ggplot(aes(x=callrate_per_sample_roundup)) + 
+#   geom_bar(position = "fill") + 
+#   scale_y_continuous(labels = scales::percent) +
+#   them +
+#   ggtitle("Probes with detP > 0.01") +
+#   labs(y = "Percentage of samples passing the call rate threshold", x = "Sample call rate threshold bins")
+## experimental-work END
+
+ggplot(sample_qc, aes(x = callrate_per_sample)) +
+  geom_histogram(breaks = unique(c(seq(0,100,25), seq(95,100,1)))) +
+  them +
+  ggtitle("Probes with detP > 0.01")
+
+print("Number of samples at various callrate thresholds :")
+for(callrate in seq(95,100,1)){
+   num = sample_qc %>% dplyr::filter(callrate_per_sample <= callrate) %>% nrow()
+   print(paste("Samples with callrate < =",callrate, "% -", num))
+}
+
+## skip-for-report START
+SAMlist$notin1_callrate99_removeNO = dplyr::filter(sample_qc, callrate_per_sample <= 99)[["Sample_ID"]]
+SAMlist$notin1_callrate98_removeMAYBE = dplyr::filter(sample_qc, callrate_per_sample <= 98)[["Sample_ID"]]
+SAMlist$notin1_callrate95_removeYES = dplyr::filter(sample_qc, callrate_per_sample <= 95)[["Sample_ID"]]
+
+write_csv(sample_qc, "ROut/QC/Tables/detP_sampleQC.csv")
+write_rds(SAMlist, "ROut/QC/RDS/SAMlist.rds")
+## skip-for-report END
+```
+
+## Summary
+
+```{r Sample_QC_summary, eval=TRUE}
+
+## summarising the numbers and reasons of removal
+
+samQC <- SAMlist %>% 
+  unlist() %>% 
+  as.data.frame() %>%
+  dplyr::select(Sample_ID = 1) %>%
+  rownames_to_column("L1") %>% 
+  tidyr::separate(L1, c("QC_reason","QC_remove"), sep = "_remove") %>% 
+  mutate_at(.vars = c("QC_reason", "QC_remove"), .funs = as.factor)
+ggplot(samQC) +
+  geom_count(aes(x=Sample_ID, y=QC_reason, color = QC_remove)) +
+  them
+
+sapply(SAMlist, length) %>% 
+  as.data.frame() %>% 
+  dplyr::select(`Number of samples tagged` = 1) %>% 
+  rownames_to_column("Sample QC Reason") %>% 
+  add_row(`Sample QC Reason` = "Total_Unique_removeYES", `Number of samples tagged` = length(SAMlist_removeYES)) %>% 
+  knitr::kable()
+
+```
+
+```{r minfi_plots}
+
+## Optional
+# save density and MDS plots from minfi functions
+# experiment with different factors to color by
+# experiment with different MDS settings
+
+all_beta <- getBeta(rgSet)
+all(colnames(all_beta)==pheno_all[["Sample_ID"]])
+
+pdata <- pheno_all %>%
+  dplyr::select(Sample_ID, Batch, RUN, Gender)
+
+pdf("ROut/QC/Plots/minfi_density.pdf")
+for(colorfactors in c("Batch", "RUN", "Gender")) densityPlot(all_beta, sampGroups = pdata[,colorfactors], main = colorfactors)
+dev.off()
+
+pdf("ROut/QC/Plots/minfi_mds1000.pdf")
+for(colorfactors in c("Batch", "RUN", "Gender")) mdsPlot(all_beta, sampGroups = pdata[, colorfactors], numPositions = 1000, legendPos = "topleft", legendNCol=1, pch=16, main = colorfactors)
+dev.off()
+
+pdf("ROut/QC/Plots/minfi_mds100000.pdf")
+for(colorfactors in c("Batch", "RUN", "Gender")) mdsPlot(all_beta, sampGroups = pdata[, colorfactors], numPositions = 100000, legendPos = "topleft", legendNCol=1, pch=16, main = colorfactors)
+dev.off()
+```
+
+
+# Probe QC
+
+## Call rate
+
+Based on number of probe-sample pairs with detection p-value more than 0.01 :  
+- if a probe has call rate of less than 75%, it is removed
+
+```{r Probe_QC_1, eval=TRUE}
+
+CPGlist = list() # skip-for-report
+# create a new list that will be populated by aptly named vectors of "bad" probes, which are either tagged with "removeYES" or "removeMAYBE"
+# it contains CpG names as defined in the rgSet 
+# this is created once but updated and saved in every probe QC chunk
+
+## skip-for-report START
+cpg_qc = detPmelt %>%
+  dplyr::filter(!(Sample_ID %in% SAMlist_removeYES)) %>%
+  dplyr::filter(detPval>0.01) %>%
+  dplyr::count(cpgs, sort = T) %>%
+  mutate(callrate_per_cpg = 100*(1-n/(dim(detP)[[2]]-length(SAMlist_removeYES))))
+## skip-for-report END
+
+## experimental-work START
+# manipulate(ggplot(cpg_qc, aes(x = callrate_per_cpg)) +
+#   geom_histogram(binwidth = binwidthslider) +
+#   them +
+#   ggtitle("Probes with detP > 0.01"),
+#   binwidthslider = slider(min = 1, max = 10, step = 1, initial = 1, label = "Binwidth"))
+## experimental-work END
+
+ggplot(cpg_qc, aes(x = callrate_per_cpg)) +
+  geom_histogram(breaks = unique(c(seq(0,100,25), seq(75,100,5)))) +
+  them +
+  ggtitle("Probes with detP > 0.01")
+
+print("Number of probes at various callrate thresholds :")
+for(callrate in c(50,75,85,100)){
+  num = cpg_qc %>% dplyr::filter(callrate_per_cpg <= callrate) %>% nrow()
+  print(paste("Probes with callrate < =",callrate, "% -", num))
+}
+
+## experimental-work START
+# cpg_qc %>% 
+#   mutate(callrate_per_cpg_roundup = as.factor(ceiling(callrate_per_cpg))) %>% 
+#   ggplot(aes(x=callrate_per_cpg_roundup)) + 
+#   geom_bar(position = "fill") + 
+#   scale_y_continuous(labels = scales::percent) +
+#   them +
+#   ggtitle("Probes with detP > 0.01") +
+#   labs(y = "Percentage of CpGs passing the call rate threshold", x = "CpG call rate threshold bins")
+## needs work
+# cpg_qc %>% 
+#     mutate(callrate_per_cpg_roundup = as.factor(ceiling(callrate_per_cpg/10))) %>% dplyr::filter(as.numeric(callrate_per_cpg_roundup)<10) %>%
+#     ggplot(aes(x="callrate_per_cpg", fill=callrate_per_cpg_roundup)) + 
+#     geom_bar(position=position_fill(reverse = T)) + scale_fill_brewer()
+## experimental-work END
+
+## skip-for-report START
+CPGlist$SAMnotYES_callrate75_removeYES = dplyr::filter(cpg_qc, callrate_per_cpg <= 75)[["cpgs"]]
+
+write_csv(cpg_qc, "ROut/QC/Tables/detP_cpgQC.csv")
+write_rds(CPGlist, "ROut/QC/RDS/CPGlist.rds")
+## skip-for-report END
+```
+
+## Y probes in females
+
+Based on number of Y-probe-Female-sample pairs with detection p-value more than 0 :  
+- if a detection p-value threshold can identify around 95% failed probes, it is selected  
+- all probes failing this newly-determined detection p-value threshold are removed
+
+```{r Probe_QC_2, eval=TRUE}
+
+## skip-for-report START
+CPGlist$y_probes_removeYES = intersect(dplyr::filter(manifestB4_basics, CHR=="Y")[["Name"]], rownames(detP))
+CPGlist$x_probes_removeYES = intersect(dplyr::filter(manifestB4_basics, CHR=="X")[["Name"]], rownames(detP))
+## skip-for-report END
+
+print("Number of Y-probes in data :")
+length(CPGlist$y_probes_removeYES)
+
+fem = repsex %>% dplyr::filter(!(Sample_ID %in% SAMlist_removeYES)) %>% filter(predictedSex=="F")
+print("Number of predicted Female samples :")
+nrow(fem)
+hom = repsex %>% dplyr::filter(!(Sample_ID %in% SAMlist_removeYES)) %>% filter(predictedSex=="M")
+print("Number of predicted Male samples :")
+nrow(hom)
+
+## skip-for-report START
+detPyf = detP[which(rownames(detP) %in% CPGlist$y_probes_removeYES),fem[["Sample_ID"]]] %>%
+  as.data.frame() %>%
+  rownames_to_column("cpgs") %>%
+  gather("Sample_ID", "detP_Y", -cpgs) %>%
+  inner_join(repsex) %>%
+  dplyr::select(-contains("med"))
+## skip-for-report END
+
+ggplot(detPyf, aes(x=detP_Y)) +
+  geom_histogram() +
+  ggtitle("Detection p-value for Y-probes in Female samples") +
+  them
+
+print("Number of Y-probes in Female samples with detection p-value > 0 :")
+(detPyf0 = detPyf %>% filter(detP_Y>0) %>% dplyr::select(cpgs) %>% unique() %>% nrow())
+print("Detection p-value for Y-probes in Female samples :")
+
+for( pval in c(0.05,0.01,1e-3,1e-4,1e-5,1e-16,0)){
+  failed = detPyf %>% filter(detP_Y>pval) %>% dplyr::select(cpgs) %>% unique() %>% nrow()
+  print(paste("Detection p-value =", pval, "Failing probes detected =", failed, "callrate =", round(failed*100/detPyf0,2)))
+}
+
+## skip-for-report START
+# edit based on your data
+CPGlist$SAMnotYES_detP0.0001_removeYES = unique(dplyr::filter(detPmelt, detPval > 1e-4)[["cpgs"]]) 
+
+write_csv(detPyf, "ROut/QC/Tables/detP_YfQC.csv")
+write_rds(CPGlist, "ROut/QC/RDS/CPGlist.rds")
+## skip-for-report END
+```
+
+## Beads
+
+Based on minfi output :  
+- if a probe has less than 3 beads on either A or B parameters in more than 5% samples, it is removed  
+- if a probe has less than 3 beads on either A or B parameters, it is *maybe* removed
+
+```{r Probe_QC_3}
+
+## skip-for-report START
+manifestB4_address <- fread("/share/projects/methyldata/manifests/m850/MethylationEPIC_v-1-0_B4.csv", skip = 7, fill = TRUE, select = c("Name", "AddressA_ID", "AddressB_ID"))
+beady <- getNBeads(rgSet) %>%
+  as.data.frame() %>%
+  dplyr::filter(!(Sample_ID %in% SAMlist_removeYES)) %>% 
+  rownames_to_column("Address") %>%
+  mutate(Address = as.numeric(Address))
+beady_manifestB4 <- manifestB4_address %>% 
+  dplyr::rename(A = AddressA_ID, B = AddressB_ID) %>%
+  gather("AB", "Address", c(A, B)) %>%
+  mutate(AB = as.factor(AB),
+         Address = as.numeric(Address)) %>%
+  inner_join(beady)
+
+ABbeads_eitherLT3 <- beady_manifestB4 %>% 
+  dplyr::filter_if(is.integer, any_vars(.<3)) %>%
+  mutate_if(is.integer, funs(ifelse(.<3, TRUE, NA))) %>% 
+  gather("Sample_ID", "eitherLT3", -c(1:3)) %>%
+  group_by(Name, Address, AB) %>%
+  summarise(NoSamABlt3 = sum(eitherLT3, na.rm = TRUE))
+nSamples = ncol(beady_manifestB4[, -c(1:3)])
+  
+rm(beady); rm(manifestB4_address); gc()
+
+CPGlist$SAMnotYES_beads3_5pc_removeYES = unique(dplyr::filter(ABbeads_eitherLT3, NoSamABlt3>0.05*nSamples)[["Name"]])
+CPGlist$SAMnotYES_beads3_all_removeMAYBE = unique(ABbeads_eitherLT3[["Name"]])
+
+write_rds(CPGlist, "ROut/QC/RDS/CPGlist.rds")
+## skip-for-report END
+```
+
+## Published lists
+
+Based on Chen/Price/McCartney *et. al.* papers :  
+- while Chen and Price papers lists are valid for both 450K and 850K, the McCartney lists are only applicable on the 850K data
+
+```{r Probe_QC_4}
+
+## skip-for-report START
+chenetal <- read_excel("/share/projects/methyldata/external/Docs/48639-non-specific-probes-Illumina450k.xlsx", sheet = "nonspecific cg probes")
+priceetal <- fread("/share/projects/methyldata/external/Docs/GPL16304-47833.txt", sep = "\t", skip = 22, select = c(1,7))
+McCartneyMorrisEvans_EPIC_crosshybridizing <- read_csv("/share/projects/methyldata/external/Docs/McCartneyMorrisEvans_EPIC_crosshybridizing.txt",
+col_names = FALSE)
+McCartneyMorrisEvans_EPIC_polymorphic <- read_delim("/share/projects/methyldata/external/Docs/McCartneyMorrisEvans_EPIC_polymorphic.txt",
+"\t", escape_double = FALSE, trim_ws = TRUE)
+
+CPGlist$chenetal_removeYES <- chenetal[["TargetID"]]
+CPGlist$priceetal_removeYES <- dplyr::filter(priceetal,!is.na(`n_target CpG SNP`))[["ID"]]
+CPGlist$mmepolymorphic_removeYES = McCartneyMorrisEvans_EPIC_polymorphic[McCartneyMorrisEvans_EPIC_polymorphic$AMR_AF>0.05,][[1]]
+CPGlist$mmecrosshybridizing_removeYES = McCartneyMorrisEvans_EPIC_crosshybridizing[[1]]
+
+write_rds(CPGlist, "ROut/QC/RDS/CPGlist.rds")
+## skip-for-report END
+```
+
+## Summary
+
+```{r Probe_QC_summary, eval=TRUE}
+
+## summarising the numbers and reasons of removal
+
+reshape::melt.list(CPGlist) %>% 
+  dplyr::rename(cpgs = value) %>% 
+  dplyr::filter(grepl("YES", L1)) %>%
+  mutate(L1=fct_infreq(as.factor(sub("_removeYES", "", L1))), 
+         data_dependent = ifelse(grepl("SAMnotYES", L1), TRUE, FALSE)) %>%
+  ggplot(aes(x=L1, fill = data_dependent)) +
+  geom_bar() +
+  stat_count(aes(y=..count.., label=..count..), geom="text", vjust = 0) +
+  them +
+  labs(x = "QC_reason", title = "Probe QC summary : removed YES") +
+  theme(axis.text.x = element_text(angle=270, hjust = 0, vjust = 0.5))
+
+print("Number of unique probes removed due to data-independent reasons : ")
+length(unique(unlist(list.remove(CPGlist, grep("SAMnotYES", names(CPGlist), value = T, invert = F)), use.names=F)))
+print("Number of unique probes removed due to data-dependent reasons : ")
+length(CPGlist_removeYES) - length(unique(unlist(list.remove(CPGlist, grep("SAMnotYES", names(CPGlist), value = T, invert = F)), use.names=F)))
+
+sapply(CPGlist, length) %>% 
+  as.data.frame() %>% 
+  dplyr::select(`Number of probes tagged` = 1) %>% 
+  rownames_to_column("Probe QC Reason") %>%
+  add_row(`Probe QC Reason` = "Total_Unique_removeYES", `Number of probes tagged` = length(CPGlist_removeYES)) %>% 
+  knitr::kable()
+
+```
+
