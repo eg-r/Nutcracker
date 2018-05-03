@@ -6,7 +6,7 @@
 # NOT OK reasons to contact : trouble with Selenium (please utilize the power of Internet for troubleshooting that)
 
 ##* Installation ####
-# Libraries to install : tidyverse, magrittr, stringr, RSelenium
+# Libraries to install : tidyverse, magrittr, stringr, data.table, RSelenium
 # Install selenium in your machine as per instructions from RSelenium - this can be a long and cumbersome process, often requiring administrative permissions, stay strong and may the force be with you
 
 ##* Troubleshoot ####
@@ -17,7 +17,7 @@
 
 ##* Caution ####
 # This script only works for the current webpage structure, if it changes in any manner (e.g., menu options), the script will have to be edited
-# Please monitor the screenshot displays to ensure that the webpage is being navigated correctly
+# In case of trouble, please monitor the screenshot displays to ensure that the webpage is being navigated correctly
 # Always do a random manual check at the end to compare machine output with human output
 # This is a hard-coded script, so it is not very flexible and breaks easily - everytime something breaks, that is patched up but new bugs may emerge ..
 
@@ -35,18 +35,22 @@ require(RSelenium)
 
 ##* Wrapper function ####
 
-# the wrapper was written to deal with huge lists which run into memory issues (the docker browser cache builds up and the cleaning commands were not helpful)
-# therefore, the wrapper function divided the original list into chunks (size defined by 'splitter') and runs each chunk in a separate block, then collates all results
+# the wrapper was written to clean the temporary files and enable the use of a master list
+# in case of interruptions, re-running the wrapper also takes care of salvaging the data from the temporary files
+# although, you may have to run the wrapper a few times if the list is huge, as it sometimes gets interrupted for reasons unknown to the cosmos
 
 ##> Arguments ####
 
 # input_list = character vector of gene names
 # name_file = name of the file which would be used to save logs, temporaty files, and final results; this can include the full path but should exclude file extensions
-# splitter = chunk sizes for big lists, default is 100
+# screenshot = if TRUE, displays screenshots at every step, default is FALSE (note : since it saves a screenshot for every step for every gene, R soon runs out of memory if the input list it too long)
+# use_master = name of the master file (with path if not in the working directory, and .csv extenstion) to use (if it exists, or create if it doesn't) and add to; this master file will comprise all the unique genese from runs so far, default is NA (in which case it is not used)
 
 ##> Results ####
 
-# if the script runs smoothly, you would get a log file (.log), a temporary file (.txt), and a results file (.csv) for every part, plus a final collated results file (.csv)
+# if the script runs smoothly, you would get one final results file (.csv), and the temporary files (.log and .txt) will be removed
+# the results file will consist of all unique and non-NA genes from the input list 
+# all files created with this script have file names that end with "_REGN" before the file extension
 
 ## Log file
 # you can check the log file dynamically (e.g. by using the terminal watch command) to see the progress of the script
@@ -66,35 +70,131 @@ require(RSelenium)
 # Last_Variant_BP = base pair location of the last Variant ID
 # Gene_Full_Location = full location of the gene as-is from the search box output
 
+## Master file
+# if the master file option is selected, collects and collates all output files
+
 ##> Example ####
 
-# run_ncbivv(input_list = c("NUP210", "c11orf10", "RASSF1"), name_file = "ncbivv_test", splitter = 2)
-# this generates 2 log files (ncbivv_test_3_part1.log, ncbivv_test_3_part2.log), 2 temporary files (ncbivv_test_3_part1.txt, ncbivv_test_3_part2.txt), and 3 results files (ncbivv_test_3_part1_2.csv [2 genes because splitter was 2], ncbivv_test_3_part2_1.csv [1 gene because total input length was 3], ncbivv_test_3.csv [all 3 genes])
+# system(command = "mkdir REGN_Test") # this is to create the testing directory
+# run_ncbivv(input_list = c("NUP210", "c11orf10", "RASSF1"), name_file = "REGN_Test/ncbivv_test", use_master = "REGN_Test/master_test.csv") # this generates 1 ncbivv_test_3_output_REGN.csv [all 3 genes]) and 1 master_test.csv [all 3 genes]
+# run_ncbivv(input_list = c("NUP210", "SOX21", "Aph1c"), name_file = "REGN_Test/ncbivv_test2", use_master = "REGN_Test/master_test.csv") # this generates 1 ncbivv_test2_3_output_REGN.csv [all 3 genes]) and updates the master_test.csv [all 5 genes]
+# system(command = "rm -r REGN_Test") # this is to remove the testing directory
 
 
-run_ncbivv <- function(input_list, name_file, splitter = 100){
+run_ncbivv <- function(input_list, name_file, screenshot = FALSE, use_master = NA){
+while(length(str_subset(list.files(path = dirname(name_file), pattern = basename(name_file)), "_output_REGN.csv"))<1){ # while loop runs until the final output file has been created
+  closeAllConnections() # closes any open connections, to deal with temporary files
+  Sys.sleep(5)
+  input_list = str_trim(input_list) %>% unique() %>% str_replace_na() %>% grep("^NA$|^$", ., value = T, ignore.case = T, invert = T) # removes whitespaces and only retains unique, valid entries
   
-  try(system(command = "sudo docker ps -q"), system(command = "sudo docker stop  $(sudo docker ps -q)")) # if the docker is already running, stops it first (this can happen when there is an interruption in the script and it exits before stopping the docker)
+  if(!is.na(use_master)) {
+  if(!file.exists(use_master) & length(list.files(path = dirname(name_file), pattern = "_output_REGN.csv"))>0) { # if specified master file does not exist, then creates one using all the output REGN files
+    message(" # # # # # # # # # # # # # # # # # # # # # ")
+    message("Creating master file : ", use_master)
+    message("# # # # # # # # # # # # # # # # # # # # # #")
+    list.files(path = dirname(name_file), pattern = "_output_REGN.csv", full.names = T) %>%
+      lapply(., read_csv) %>%
+      rbindlist(.) %>%
+      as.data.frame() %>%
+      distinct() %>% 
+      group_by(Given_Name) %>% 
+      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP)) %>%
+      write_csv(use_master)
+  } 
+  if(file.exists(use_master)) {# then uses the newly created or existing master file
+    message(" # # # # # # # # # # # # # # # # # # # # # ")
+    message("Using master file : ", use_master)
+    message("# # # # # # # # # # # # # # # # # # # # # #")
+    master_sofar <- read_csv(use_master) %>% 
+      inner_join(data.frame(Given_Name = input_list)) %>% 
+      distinct() %>% 
+      group_by(Given_Name) %>% 
+      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP))
+    write_csv(master_sofar, paste0(name_file, "_", nrow(master_sofar), "_frommaster_REGN.csv"))
+  }
+  }# creates a subset of the master file that is part of the input list, so that the genes that have previously been run, need not be run again
+  # however, there might exist some updates to some genes, therefore, the largest difference in the first and last positions is used
   
-  input_list = str_trim(input_list) %>% unique() # removes whitespaces and only retains unique entries
+  temp_sofar <- str_subset(list.files(path = dirname(name_file), pattern = paste0(basename(name_file), "_"), full.names = T), "_REGN.txt")
+  if(length(temp_sofar)>0) { # finds and uses temporary text files
+    tryCatch(lapply(temp_sofar, read_tsv) %>%
+      rbindlist(.) %>% 
+      as.data.frame() %>% 
+      mutate(Chromosome = str_match(Gene_Full_Location, "Chr(.*?):")[,2]) %>%
+      mutate_at(c("First_Variant_BP", "Last_Variant_BP"), funs(str_replace_all(., ",", ""))) %>%
+      dplyr::select(Given_Name, Gene, Chromosome, First_Variant_BP, Last_Variant_BP, Gene_Full_Location) %>% 
+      write_csv(paste0(name_file,"_rescue_REGN.csv")), error = function(e) e)
+  } # creates a rescue file from the temporary text files
+  results_sofar <- NULL
+    check_sofar <- str_subset(list.files(path = dirname(name_file), pattern = paste0(basename(name_file), "_"), full.names = T), "_REGN.csv")
+    if(length(check_sofar)>0) results_sofar <- lapply(check_sofar, read_csv) %>% rbindlist(.) # finds and uses incomplete output files
   
-  # if the splitter value is more than the list, then the list is divided up into chunks and the results are collated at the end
-  if(length(input_list) > splitter){
-    split_input_list <- split(input_list, ceiling(seq_along(input_list)/splitter))
-    ncbivv_result <- mapply(ncbivv, 
-                            input_list = split_input_list, 
-                            name_file = paste0(name_file, "_", length(input_list), "_part", seq_along(split_input_list)), # each chunk is also saved with the length of the total input (unique entries) and the part/chunk number added to the name
-                            SIMPLIFY = FALSE) %>% 
-      data.table::rbindlist(.)
-    write_csv(ncbivv_result, paste0(name_file, "_", length(input_list), ".csv")) # collated result has the length of the total input (unique entries) added to the name
-  } else 
-    ncbivv_result <- ncbivv(input_list = input_list, name_file = name_file)
-  return(ncbivv_result)
+  temp_to_remove <- str_subset(list.files(path = dirname(name_file), pattern = paste0(basename(name_file), "_"), full.names = T), "_REGN")
+  
+  message(" # # # # # # # # # # # # # # # # # # # # # ")
+  message("Using and removing temporary files :")
+  print(temp_to_remove)
+  message("# # # # # # # # # # # # # # # # # # # # # #")
+  
+  input_bad <- temp_to_remove %>% 
+    str_subset(".log") %>% # finds and uses temporary log files
+    sapply(., read_lines) %>% 
+    unlist() %>% 
+    str_subset("Skipping") %>% 
+    str_remove("Skipping : No results found - ") # finds the genes that were skipped, and adds them in the output with NA values, so that these are not re-run several times
+  
+  tryCatch(results_sofar %<>% 
+             as.data.frame %>% 
+             full_join(data.frame(Given_Name = input_bad)) %>% 
+             inner_join(data.frame(Given_Name = input_list)) %>% 
+             distinct(), error = function(e) e)
+  
+  walk(temp_to_remove, file.remove)
+  
+  write_csv(as.data.frame(results_sofar), paste0(name_file, "_", nrow(results_sofar), "_incomplete_REGN.csv"))
+  # creates an incomplete file using all the temporary log and text files, as well as the rescued and master subset files
+  
+  if(setequal(input_list, results_sofar[[1]])) { # if the input list is complete, produces final output file
+    message(" # # # # # # # # # # # # # # # # # # # # # ")
+    message("Completed !!!", "\nFinished number of genes = ", length(input_list))
+    message("# # # # # # # # # # # # # # # # # # # # # #")
+    write_csv(results_sofar, paste0(name_file, "_", nrow(results_sofar), "_output_REGN.csv"))
+    temp_to_remove <- grep("_output_REGN.csv$", str_subset(list.files(path = dirname(name_file), pattern = basename(name_file), full.names = T), "_REGN"), invert = TRUE, value = TRUE)
+    
+    message(" # # # # # # # # # # # # # # # # # # # # # ")
+    message("Using and removing temporary files :")
+    print(temp_to_remove)
+    message("# # # # # # # # # # # # # # # # # # # # # #")
+    
+    walk(temp_to_remove, file.remove) 
+    if(!is.na(use_master)) { # creates or updates the master file
+      message(" # # # # # # # # # # # # # # # # # # # # # ")
+      message("Creating/Updating master file :", use_master)
+      message("# # # # # # # # # # # # # # # # # # # # # #")
+      list.files(path = dirname(name_file), pattern = "_output_REGN.csv", full.names = T) %>%
+      lapply(., read_csv) %>%
+      rbindlist(.) %>%
+      as.data.frame() %>%
+      distinct() %>%
+      write_csv(use_master)}
+    } else {
+  
+  input_list_trunc = setdiff(input_list, results_sofar[[1]]) # if there is remnant input list, runs the remaining genes
+  message(" # # # # # # # # # # # # # # # # # # # # # ")
+  message("Length of input list total = ", length(input_list))
+  message("Length of input list done = ", length(results_sofar[[1]]))
+  message("Length of input list remaining = ", length(input_list_trunc))
+  message("# # # # # # # # # # # # # # # # # # # # # #")
+  
+  ncbivv(input_list = input_list_trunc, name_file = name_file, screenshot = screenshot)
+  Sys.sleep(10)
+    }
+}
 }
 
 ##* Main function ####
 
-ncbivv <- function(input_list, name_file) {
+ncbivv <- function(input_list, name_file, screenshot = FALSE) {
   
   #### Setup webpage in docker browser ####
   
@@ -108,8 +208,10 @@ ncbivv <- function(input_list, name_file) {
   remDr <- remoteDriver(port = 4445) ## starts server ##
   remDr$open()
   
+  if(screenshot) message("Caution : displaying screenshots, if the list is very long (>100), might run out of memory")
+  
   remDr$navigate("https://www.ncbi.nlm.nih.gov/variation/view/") ## opens NCBI Variation Viewer webpage ##
-  Sys.sleep(5); remDr$screenshot(display = TRUE) # this command is used variably throughout, it put the system on sleep for the number of seconds indicated so that the browser has enough time to load the webpage according to the preceding command, then it displays a screenshot of the current webpage
+  Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE) # this command is used variably throughout, it put the system on sleep for the number of seconds indicated so that the browser has enough time to load the webpage according to the preceding command, then it displays a screenshot of the current webpage
   
   ####| "Pick Assembly" ####
   ## "Pick Assembly" section starts ##
@@ -117,28 +219,28 @@ ncbivv <- function(input_list, name_file) {
   
   assembly_click <- remDr$findElement(using = "css selector", ".gb-region-navigator .gb-section:nth-child(1) span:nth-child(1)")
   assembly_click$clickElement()
-  Sys.sleep(5); remDr$screenshot(display = TRUE)
+  Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
   
   assembly_menu <- remDr$findElement(using = "css", ".gb-ds-item")
   assembly_menu$clickElement()
-  Sys.sleep(5); remDr$screenshot(display = TRUE)
+  Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
   
   assembly_default <- remDr$findElement(using = "css", ".gb-selected")
-  Sys.sleep(5); remDr$screenshot(display = TRUE)
+  Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
   
   remDr$mouseMoveToLocation(webElement = assembly_default)
   remDr$sendKeysToActiveElement(list(key = "down_arrow", key = "enter"))# this part will need editing if "Pick Assembly" menu options change
-  Sys.sleep(5); remDr$screenshot(display = TRUE)
+  Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
   
   ## "Pick Assembly" section ends ##
   
-  ncbivv_log <- file(paste0(name_file, ".log"), "w+") # logs script messages to a text file, use this file to investigate sources of error
+  ncbivv_log <- file(paste0(name_file, "_REGN.log"), "w+") # logs script messages to a text file, use this file to investigate sources of error
   
   sink(ncbivv_log, type = "message")
   
   message("Processing : ")
   
-  ncbivv_con <- file(paste0(name_file, ".txt"), "w+") # writes temporary results in a text file, use this file to recover output if the script is interrupted and does not produce neatly collated results
+  ncbivv_con <- file(paste0(name_file, "_REGN.txt"), "w+") # writes temporary results in a text file, use this file to recover output if the script is interrupted and does not produce neatly collated results
   
   output_matrix <- matrix(data = NA, nrow = length(input_list), ncol = 5, dimnames = list(input_list, c("Given_Name", "Gene", "First_Variant_BP", "Last_Variant_BP", "Gene_Full_Location")))
   
@@ -157,15 +259,15 @@ ncbivv <- function(input_list, name_file) {
     
     search_click <- remDr$findElement(using = "css", "#loc-search")
     search_click$clearElement() ## clears search box
-    remDr$screenshot(display = TRUE)
+    if(screenshot) remDr$screenshot(display = TRUE)
     search_click$sendKeysToElement(list(input_list[listed_genes], key = "enter"))
     Sys.sleep(10)
-    try(remDr$screenshot(display = TRUE), TRUE)
+    try(remDr$screenshot(display = FALSE), TRUE)
     if(remDr$status > 0) {
-      message("Skipping : No results found")
+      message("Skipping : No results found - ", input_list[listed_genes])
       message(remDr$statusCodes[which(remDr$statusCodes$Code == remDr$status),])
       next
-      }
+    }
     
     gene_name <- remDr$findElement(using = "css", ".grid-data tr:nth-child(1) .gbs-name")
     
@@ -177,11 +279,12 @@ ncbivv <- function(input_list, name_file) {
       message("Different names : Given = ", input_list[listed_genes], " , Found = ", gene_name$getElementText()[[1]])
       gene_select <- remDr$findElement(using = "css", "tr:nth-child(1) .ctrl span")
       gene_select$clickElement()
-      Sys.sleep(10); remDr$screenshot(display = TRUE)}
+      Sys.sleep(10); if(screenshot) remDr$screenshot(display = TRUE)
+      }
     output_matrix[listed_genes, "Gene"] <- gene_name$getElementText()[[1]]
     
     gene_position <- remDr$findElement(using = "css", ".grid-data tr:nth-child(1) .gbs-location span") ## gets full gene location/position from the search box result##
-
+    
     output_matrix[listed_genes, "Gene_Full_Location"] <- gene_position$getElementText()[[1]]
     
     ####| "Source database" ####
@@ -190,7 +293,7 @@ ncbivv <- function(input_list, name_file) {
     dbSNP_click <- remDr$findElement(using = "css", "#SourceDB_ID_value_0") ## checks the "dbSNP" box in "Source database"
     if(!dbSNP_click$isElementSelected()[[1]]) {
       dbSNP_click$clickElement()
-      Sys.sleep(10); remDr$screenshot(display = TRUE)
+      Sys.sleep(10); if(screenshot) remDr$screenshot(display = TRUE)
     }
     
     ####| "Variant type" ####
@@ -199,7 +302,7 @@ ncbivv <- function(input_list, name_file) {
     varSNP_click <- remDr$findElement(using = "css", "#VarType_ID_value_1483")
     if(!varSNP_click$isElementSelected()[[1]]) {
       varSNP_click$clickElement()
-      Sys.sleep(10); remDr$screenshot(display = TRUE)
+      Sys.sleep(10); if(screenshot) remDr$screenshot(display = TRUE)
     }
     
     #### Variation data table ####
@@ -219,11 +322,11 @@ ncbivv <- function(input_list, name_file) {
     if(numpages > 2){ ## if the number of pages is more than 2, it goes to the 'last' page
       dbSNP_endclick <- remDr$findElement(using = "css", ".nav-controls .ui-ncbigrid-paged-pageControl-last")
       dbSNP_endclick$clickElement()
-      Sys.sleep(5); remDr$screenshot(display = TRUE)
+      Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
     } else if(numpages == 2){ ## if the number of pages is more than 2, it goes to the 'next' page
       dbSNP_endclick <- remDr$findElement(using = "css", ".nav-controls .next")
       dbSNP_endclick$clickElement()
-      Sys.sleep(5); remDr$screenshot(display = TRUE)
+      Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
     }  ## if the number of pages is 1, it stays on the 'first' page
     
     dbSNP_end <- remDr$findElements(using = "css", ".vdt-location")
@@ -232,9 +335,9 @@ ncbivv <- function(input_list, name_file) {
     write_lines(str_c(output_matrix[listed_genes,], collapse = "\t"), ncbivv_con, append = TRUE)
   }
   
-  sink(NULL, type = "message")
+  on.exit(sink(NULL, type = "message"), add = TRUE)
   
-  close(ncbivv_con)  
+  on.exit(close(ncbivv_con), add = TRUE)
   
   # this chunk cleans up the data generated from the for loop above to write a csv file
   # in case there were interruptions and all you have is the temporary text file, then you can supply that information and use this code to get the clean output
@@ -245,20 +348,14 @@ ncbivv <- function(input_list, name_file) {
     mutate_at(c("First_Variant_BP", "Last_Variant_BP"), funs(str_replace_all(., ",", ""))) %>%
     dplyr::select(Given_Name, Gene, Chromosome, First_Variant_BP, Last_Variant_BP, Gene_Full_Location)
   
-  write_csv(output_matrix, paste0(name_file, "_", length(input_list), ".csv")) # add the total number of entries to the name of the file
-  
-  remDr$close()
-  remDr$closeServer()
-  remDr$quit()
+  write_csv(output_matrix, paste0(name_file, "_", nrow(output_matrix), "_REGN.csv")) # add the total number of entries to the name of the file
   
   message("Stopping docker by running this in the terminal : \n 
         sudo docker stop  $(sudo docker ps -q)")
   
-  system(command = "sudo docker stop  $(sudo docker ps -q)")
+  on.exit(system(command = "sudo docker stop  $(sudo docker ps -q)"), add = TRUE)
   
   Sys.sleep(10)
   
-  close(ncbivv_log)
-  
-  return(output_matrix)
+  on.exit(close(ncbivv_log), add = TRUE)
 }
