@@ -98,7 +98,8 @@ while(length(str_subset(list.files(path = dirname(name_file), pattern = basename
       as.data.frame() %>%
       distinct() %>% 
       group_by(Given_Name) %>% 
-      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP)) %>%
+      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP)) %>% 
+      summarise_all(funs(first(na.omit(.)))) %>%
       write_csv(use_master)
   } 
   if(file.exists(use_master)) {# then uses the newly created or existing master file
@@ -109,7 +110,8 @@ while(length(str_subset(list.files(path = dirname(name_file), pattern = basename
       inner_join(data.frame(Given_Name = input_list)) %>% 
       distinct() %>% 
       group_by(Given_Name) %>% 
-      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP))
+      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP)) %>% 
+      summarise_all(funs(first(na.omit(.))))
     write_csv(master_sofar, paste0(name_file, "_", nrow(master_sofar), "_frommaster_REGN.csv"))
   }
   }# creates a subset of the master file that is part of the input list, so that the genes that have previously been run, need not be run again
@@ -175,7 +177,10 @@ while(length(str_subset(list.files(path = dirname(name_file), pattern = basename
       lapply(., read_csv) %>%
       rbindlist(.) %>%
       as.data.frame() %>%
-      distinct() %>%
+      distinct() %>% 
+      group_by(Given_Name) %>% 
+      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP)) %>% 
+      summarise_all(funs(first(na.omit(.)))) %>%
       write_csv(use_master)}
     } else {
   
