@@ -45,6 +45,7 @@ require(RSelenium)
 # name_file = name of the file which would be used to save logs, temporaty files, and final results; this can include the full path but should exclude file extensions
 # screenshot = if TRUE, displays screenshots at every step, default is FALSE (note : since it saves a screenshot for every step for every gene, R soon runs out of memory if the input list it too long)
 # use_master = name of the master file (with path if not in the working directory, and .csv extenstion) to use (if it exists, or create if it doesn't) and add to; this master file will comprise all the unique genese from runs so far, default is NA (in which case it is not used)
+# increase_wait = number of seconds that will be added to the waiting time at each step (one number is added to all); use this if the internet speed is slow
 
 ##> Results ####
 
@@ -76,16 +77,35 @@ require(RSelenium)
 ##> Example ####
 
 # system(command = "mkdir REGN_Test") # this is to create the testing directory
-# run_ncbivv(input_list = c("NUP210", "c11orf10", "RASSF1"), name_file = "REGN_Test/ncbivv_test", use_master = "REGN_Test/master_test.csv") # this generates 1 ncbivv_test_3_output_REGN.csv [all 3 genes]) and 1 master_test.csv [all 3 genes]
+# run_ncbivv(input_list = c("NUP210", "c11orf10", "RASSF1"), name_file = "REGN_Test/ncbivv_test1", use_master = "REGN_Test/master_test.csv") # this generates 1 ncbivv_test_3_output_REGN.csv [all 3 genes]) and 1 master_test.csv [all 3 genes]
 # run_ncbivv(input_list = c("NUP210", "SOX21", "Aph1c"), name_file = "REGN_Test/ncbivv_test2", use_master = "REGN_Test/master_test.csv") # this generates 1 ncbivv_test2_3_output_REGN.csv [all 3 genes]) and updates the master_test.csv [all 5 genes]
 # system(command = "rm -r REGN_Test") # this is to remove the testing directory
 
 
-run_ncbivv <- function(input_list, name_file, screenshot = FALSE, use_master = NA){
+run_ncbivv <- function(input_list, name_file, screenshot = FALSE, use_master = NA, increase_wait = 0){
 while(length(str_subset(list.files(path = dirname(name_file), pattern = basename(name_file)), "_output_REGN.csv"))<1){ # while loop runs until the final output file has been created
   closeAllConnections() # closes any open connections, to deal with temporary files
-  Sys.sleep(5)
+  Sys.sleep(5+increase_wait)
   input_list = str_trim(input_list) %>% unique() %>% str_replace_na() %>% grep("^NA$|^$", ., value = T, ignore.case = T, invert = T) # removes whitespaces and only retains unique, valid entries
+  
+  deal_dups <- function(dff) {
+    dff_mixed <- dff %>% 
+      distinct() %>% 
+      group_by(Given_Name) %>% 
+      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP))
+    dff_singles <- dff_mixed %>% 
+      add_count() %>% 
+      dplyr::filter(n==1) %>% 
+      dplyr::select(-n)
+    dff_doubles <- dff_mixed %>% 
+      add_count() %>% 
+      dplyr::filter(n>1) %>% 
+      dplyr::select(-n)
+    if(nrow(dff_doubles)>0) dff_doubles %>% 
+      summarise_all(funs(first(na.omit(.)))) %>% 
+      full_join(dff_singles) %>% 
+      return() else return(dff_singles)
+  }
   
   if(!is.na(use_master)) {
   if(!file.exists(use_master) & length(list.files(path = dirname(name_file), pattern = "_output_REGN.csv"))>0) { # if specified master file does not exist, then creates one using all the output REGN files
@@ -96,10 +116,7 @@ while(length(str_subset(list.files(path = dirname(name_file), pattern = basename
       lapply(., read_csv) %>%
       rbindlist(.) %>%
       as.data.frame() %>%
-      distinct() %>% 
-      group_by(Given_Name) %>% 
-      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP)) %>% 
-      summarise_all(funs(first(na.omit(.)))) %>%
+      deal_dups() %>%
       write_csv(use_master)
   } 
   if(file.exists(use_master)) {# then uses the newly created or existing master file
@@ -108,10 +125,7 @@ while(length(str_subset(list.files(path = dirname(name_file), pattern = basename
     message("# # # # # # # # # # # # # # # # # # # # # #")
     master_sofar <- read_csv(use_master) %>% 
       inner_join(data.frame(Given_Name = input_list)) %>% 
-      distinct() %>% 
-      group_by(Given_Name) %>% 
-      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP)) %>% 
-      summarise_all(funs(first(na.omit(.))))
+      deal_dups()
     write_csv(master_sofar, paste0(name_file, "_", nrow(master_sofar), "_frommaster_REGN.csv"))
   }
   }# creates a subset of the master file that is part of the input list, so that the genes that have previously been run, need not be run again
@@ -177,10 +191,7 @@ while(length(str_subset(list.files(path = dirname(name_file), pattern = basename
       lapply(., read_csv) %>%
       rbindlist(.) %>%
       as.data.frame() %>%
-      distinct() %>% 
-      group_by(Given_Name) %>% 
-      dplyr::filter((Last_Variant_BP-First_Variant_BP)==max(Last_Variant_BP-First_Variant_BP) | is.na(Last_Variant_BP-First_Variant_BP)) %>% 
-      summarise_all(funs(first(na.omit(.)))) %>%
+      deal_dups() %>%
       write_csv(use_master)}
     } else {
   
@@ -191,15 +202,15 @@ while(length(str_subset(list.files(path = dirname(name_file), pattern = basename
   message("Length of input list remaining = ", length(input_list_trunc))
   message("# # # # # # # # # # # # # # # # # # # # # #")
   
-  ncbivv(input_list = input_list_trunc, name_file = name_file, screenshot = screenshot)
-  Sys.sleep(10)
+  ncbivv(input_list = input_list_trunc, name_file = name_file, screenshot = screenshot, increase_wait = increase_wait)
+  Sys.sleep(10+increase_wait)
     }
 }
 }
 
 ##* Main function ####
 
-ncbivv <- function(input_list, name_file, screenshot = FALSE) {
+ncbivv <- function(input_list, name_file, screenshot = FALSE, increase_wait = 0) {
   
   #### Setup webpage in docker browser ####
   
@@ -208,7 +219,7 @@ ncbivv <- function(input_list, name_file, screenshot = FALSE) {
   
   system(command = "sudo docker run -d -p 4445:4444 selenium/standalone-firefox:2.53.1")
   
-  Sys.sleep(10)
+  Sys.sleep(10+increase_wait)
   
   remDr <- remoteDriver(port = 4445) ## starts server ##
   remDr$open()
@@ -216,7 +227,7 @@ ncbivv <- function(input_list, name_file, screenshot = FALSE) {
   if(screenshot) message("Caution : displaying screenshots, if the list is very long (>100), might run out of memory")
   
   remDr$navigate("https://www.ncbi.nlm.nih.gov/variation/view/") ## opens NCBI Variation Viewer webpage ##
-  Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE) # this command is used variably throughout, it put the system on sleep for the number of seconds indicated so that the browser has enough time to load the webpage according to the preceding command, then it displays a screenshot of the current webpage
+  Sys.sleep(5+increase_wait); if(screenshot) remDr$screenshot(display = TRUE) # this command is used variably throughout, it put the system on sleep for the number of seconds indicated so that the browser has enough time to load the webpage according to the preceding command, then it displays a screenshot of the current webpage
   
   ####| "Pick Assembly" ####
   ## "Pick Assembly" section starts ##
@@ -224,18 +235,18 @@ ncbivv <- function(input_list, name_file, screenshot = FALSE) {
   
   assembly_click <- remDr$findElement(using = "css selector", ".gb-region-navigator .gb-section:nth-child(1) span:nth-child(1)")
   assembly_click$clickElement()
-  Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
+  Sys.sleep(5+increase_wait); if(screenshot) remDr$screenshot(display = TRUE)
   
   assembly_menu <- remDr$findElement(using = "css", ".gb-ds-item")
   assembly_menu$clickElement()
-  Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
+  Sys.sleep(5+increase_wait); if(screenshot) remDr$screenshot(display = TRUE)
   
   assembly_default <- remDr$findElement(using = "css", ".gb-selected")
-  Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
+  Sys.sleep(5+increase_wait); if(screenshot) remDr$screenshot(display = TRUE)
   
   remDr$mouseMoveToLocation(webElement = assembly_default)
   remDr$sendKeysToActiveElement(list(key = "down_arrow", key = "enter"))# this part will need editing if "Pick Assembly" menu options change
-  Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
+  Sys.sleep(5+increase_wait); if(screenshot) remDr$screenshot(display = TRUE)
   
   ## "Pick Assembly" section ends ##
   
@@ -266,11 +277,14 @@ ncbivv <- function(input_list, name_file, screenshot = FALSE) {
     search_click$clearElement() ## clears search box
     if(screenshot) remDr$screenshot(display = TRUE)
     search_click$sendKeysToElement(list(input_list[listed_genes], key = "enter"))
-    Sys.sleep(10)
+    Sys.sleep(10+increase_wait)
     try(remDr$screenshot(display = FALSE), TRUE)
+    
     if(remDr$status > 0) {
       message("Skipping : No results found - ", input_list[listed_genes])
       message(remDr$statusCodes[which(remDr$statusCodes$Code == remDr$status),])
+      remDr$refresh()
+      Sys.sleep(5+increase_wait)
       next
     }
     
@@ -284,7 +298,7 @@ ncbivv <- function(input_list, name_file, screenshot = FALSE) {
       message("Different names : Given = ", input_list[listed_genes], " , Found = ", gene_name$getElementText()[[1]])
       gene_select <- remDr$findElement(using = "css", "tr:nth-child(1) .ctrl span")
       gene_select$clickElement()
-      Sys.sleep(10); if(screenshot) remDr$screenshot(display = TRUE)
+      Sys.sleep(10+increase_wait); if(screenshot) remDr$screenshot(display = TRUE)
       }
     output_matrix[listed_genes, "Gene"] <- gene_name$getElementText()[[1]]
     
@@ -298,7 +312,7 @@ ncbivv <- function(input_list, name_file, screenshot = FALSE) {
     dbSNP_click <- remDr$findElement(using = "css", "#SourceDB_ID_value_0") ## checks the "dbSNP" box in "Source database"
     if(!dbSNP_click$isElementSelected()[[1]]) {
       dbSNP_click$clickElement()
-      Sys.sleep(10); if(screenshot) remDr$screenshot(display = TRUE)
+      Sys.sleep(10+increase_wait); if(screenshot) remDr$screenshot(display = TRUE)
     }
     
     ####| "Variant type" ####
@@ -307,7 +321,7 @@ ncbivv <- function(input_list, name_file, screenshot = FALSE) {
     varSNP_click <- remDr$findElement(using = "css", "#VarType_ID_value_1483")
     if(!varSNP_click$isElementSelected()[[1]]) {
       varSNP_click$clickElement()
-      Sys.sleep(10); if(screenshot) remDr$screenshot(display = TRUE)
+      Sys.sleep(10+increase_wait); if(screenshot) remDr$screenshot(display = TRUE)
     }
     
     #### Variation data table ####
@@ -327,11 +341,11 @@ ncbivv <- function(input_list, name_file, screenshot = FALSE) {
     if(numpages > 2){ ## if the number of pages is more than 2, it goes to the 'last' page
       dbSNP_endclick <- remDr$findElement(using = "css", ".nav-controls .ui-ncbigrid-paged-pageControl-last")
       dbSNP_endclick$clickElement()
-      Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
+      Sys.sleep(5+increase_wait); if(screenshot) remDr$screenshot(display = TRUE)
     } else if(numpages == 2){ ## if the number of pages is more than 2, it goes to the 'next' page
       dbSNP_endclick <- remDr$findElement(using = "css", ".nav-controls .next")
       dbSNP_endclick$clickElement()
-      Sys.sleep(5); if(screenshot) remDr$screenshot(display = TRUE)
+      Sys.sleep(5+increase_wait); if(screenshot) remDr$screenshot(display = TRUE)
     }  ## if the number of pages is 1, it stays on the 'first' page
     
     dbSNP_end <- remDr$findElements(using = "css", ".vdt-location")
@@ -360,7 +374,7 @@ ncbivv <- function(input_list, name_file, screenshot = FALSE) {
   
   on.exit(system(command = "sudo docker stop  $(sudo docker ps -q)"), add = TRUE)
   
-  Sys.sleep(10)
+  Sys.sleep(10+increase_wait)
   
   on.exit(close(ncbivv_log), add = TRUE)
 }
