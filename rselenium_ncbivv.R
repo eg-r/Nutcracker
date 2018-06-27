@@ -100,11 +100,22 @@ while(length(str_subset(list.files(path = dirname(name_file), pattern = basename
     dff_doubles <- dff_mixed %>% 
       add_count() %>% 
       dplyr::filter(n>1) %>% 
-      dplyr::select(-n)
-    if(nrow(dff_doubles)>0) dff_doubles %>% 
-      summarise_all(funs(first(na.omit(.)))) %>% 
-      full_join(dff_singles) %>% 
-      return() else return(dff_singles)
+      dplyr::select(-n) %>% 
+      ungroup()
+    if(nrow(dff_doubles)>0) {
+      message("Resolving multiples by taking maximum length")
+      print(dff_doubles)
+     dff_len <- dff_doubles %>% 
+        mutate_all(str_length) %>% 
+        transmute(len = rowSums(., na.rm = T))
+      dff_doubles %>% 
+        mutate(len = dff_len$len) %>% 
+        group_by(Given_Name) %>% 
+        dplyr::filter(len==max(len)) %>% 
+        dplyr::select(-len) %>%
+        full_join(dff_singles) %>% 
+        return()
+      } else return(dff_singles)
   }
   
   if(!is.na(use_master)) {
